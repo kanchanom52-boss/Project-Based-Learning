@@ -2,11 +2,12 @@
 StudyMateAI - a multi-user study companion built with Streamlit.
 
 Pages: Home, My Profile, AI Assistant Chat, Subjects & Grades, Concept Quiz,
-Assignments, Attendance Ledger, Tasks Todo List, Study Planner.
+Assignments, Attendance Tracker, Tasks Todo List, Study Planner.
 
 Run:  streamlit run app.py
 AI features need an ANTHROPIC_API_KEY (environment variable or .streamlit/secrets.toml).
 """
+import calendar
 import hashlib
 import hmac
 import json
@@ -142,7 +143,7 @@ def auth_screen():
 
 # ───────────────────────────── AI helpers ─────────────────────────────
 def get_api_key():
-    key = os.environ.get("ANTHROPIC_API_KEY")
+    key = st.session_state.get("user_api_key") or os.environ.get("ANTHROPIC_API_KEY")
     if key:
         return key
     try:
@@ -154,14 +155,25 @@ def get_api_key():
 def ai_call(messages, system, max_tokens=1500):
     key = get_api_key()
     if not key:
-        return None, "AI is not configured. Set the ANTHROPIC_API_KEY environment variable and restart."
+        return None, "No API key found. Paste your key in the AI settings box on the AI Assistant Chat page."
     try:
         import anthropic
-
-        client = anthropic.Anthropic(api_key=key)
+    except ImportError:
+        return None, "The 'anthropic' package is missing. Run: python -m pip install anthropic"
+    try:
+        client = anthropic.Anthropic(api_key=key, timeout=60.0, max_retries=1)
         resp = client.messages.create(model=MODEL, max_tokens=max_tokens, system=system, messages=messages)
         return "".join(b.text for b in resp.content if getattr(b, "type", "") == "text"), None
-    except Exception as e:  # network, auth, rate limit...
+    except anthropic.AuthenticationError:
+        return None, "Your API key was rejected. Check that you copied the whole key (starts with sk-ant-)."
+    except anthropic.NotFoundError:
+        return None, f"The model '{MODEL}' was not found for your account. Set STUDYMATE_MODEL to a model you can use."
+    except anthropic.RateLimitError:
+        return None, "Rate limit reached. Wait a minute and try again."
+    except (anthropic.APIConnectionError, anthropic.APITimeoutError):
+        return None, ("Could not reach Anthropic within 60 seconds. Check your internet, turn off any VPN or proxy, "
+                      "and make sure your firewall or antivirus allows Python to connect to api.anthropic.com.")
+    except Exception as e:  # credits, bad request, etc.
         return None, f"AI request failed: {e}"
 
 
@@ -285,6 +297,18 @@ def page_profile(email):
 def page_chat(email):
     st.title("🤖 AI Assistant Chat")
     st.caption("Ask doubts, get explanations, summaries, or study tips. Your chats are saved to your account.")
+    if not get_api_key():
+        st.warning("No AI key found yet. Paste your Anthropic API key below to turn the chat on.")
+    with st.expander("🔑 AI settings", expanded=not get_api_key()):
+        k = st.text_input("Anthropic API key", type="password",
+                          help="Kept only for this browser session. It is not saved in the database.")
+        if k.strip():
+            k = k.strip().strip("\"'").strip()
+            st.session_state["user_api_key"] = k
+            ok_shape = k.startswith("sk-ant-") and len(k) > 60
+            st.caption(f"Key received: starts with '{k[:7]}', {len(k)} characters. "
+                       + ("Looks like a valid key format." if ok_shape else
+                          "This does NOT look like a full Anthropic key (should start with sk-ant- and be 100+ characters)."))
     history = q("SELECT role, content FROM chat WHERE email=? ORDER BY id", (email,))
     for m in history:
         with st.chat_message(m["role"]):
@@ -296,11 +320,11 @@ def page_chat(email):
 
     prompt = st.chat_input("Ask StudyMateAI anything…")
     if prompt:
-        run("INSERT INTO chat(email, role, content, ts) VALUES(?,?,?,?)",
-            (email, "user", prompt, datetime.now().isoformat()))
         with st.chat_message("user"):
             st.markdown(prompt)
         msgs = [{"role": m["role"], "content": m["content"]} for m in history[-20:]]
+        while msgs and msgs[0]["role"] != "user":
+            msgs.pop(0)
         msgs.append({"role": "user", "content": prompt})
         system = ("You are StudyMateAI, a friendly, accurate tutor for students. Explain step by step, "
                   "use simple examples, and keep answers focused. Student profile: "
@@ -312,6 +336,8 @@ def page_chat(email):
                 st.error(err)
             else:
                 st.markdown(reply)
+                run("INSERT INTO chat(email, role, content, ts) VALUES(?,?,?,?)",
+                    (email, "user", prompt, datetime.now().isoformat()))
                 run("INSERT INTO chat(email, role, content, ts) VALUES(?,?,?,?)",
                     (email, "assistant", reply, datetime.now().isoformat()))
 
@@ -532,50 +558,150 @@ def page_assignments(email):
                 st.rerun()
 
 
+def set_attendance(email, sid, day, status):
+    """Save one subject's status for one day. 'No class' removes the record."""
+    run("DELETE FROM attendance WHERE email=? AND subject_id=? AND day=?", (email, sid, day))
+    if status in ("Present", "Absent"):
+        run("INSERT INTO attendance(email, subject_id, day, status) VALUES(?,?,?,?)",
+            (email, sid, day, status))
+
+
 def page_attendance(email):
-    st.title("🗓️ Attendance Ledger")
+    st.title("🗓️ Attendance Tracker")
+    ss = st.session_state
+    ss.setdefault("att_ver", 0)
+    if ss.get("att_flash"):
+        st.success(ss.pop("att_flash"))
+
     subs = subjects_of(email)
     if not subs:
-        st.info("Add subjects in **Subjects & Grades** first.")
+        st.info("Add your subjects in **Subjects & Grades** first, then come back to track attendance.")
         return
-    target = st.slider("Target attendance %", 50, 95, 75)
+    names = [s["name"] for s in subs]
+    labels = {s["id"]: (s["name"] if names.count(s["name"]) == 1 else f"{s['name']} ({s['id']})") for s in subs}
 
-    with st.form("mark_att", clear_on_submit=False):
-        c1, c2, c3 = st.columns(3)
-        sid = c1.selectbox("Subject", [s["id"] for s in subs],
-                           format_func=lambda i: next(s["name"] for s in subs if s["id"] == i))
-        d = c2.date_input("Date", date.today())
-        status = c3.selectbox("Status", ["Present", "Absent"])
-        if st.form_submit_button("Mark attendance", type="primary"):
-            run("DELETE FROM attendance WHERE email=? AND subject_id=? AND day=?", (email, sid, d.isoformat()))
-            run("INSERT INTO attendance(email, subject_id, day, status) VALUES(?,?,?,?)",
-                (email, sid, d.isoformat(), status))
-            st.success("Recorded.")
+    target = st.slider("Target attendance %", 50, 95, 75, key="att_target")
+    t = target / 100
+    summary = attendance_summary(email)
+    tot_p = sum(r["Attended"] for r in summary)
+    tot_t = sum(r["Total"] for r in summary)
+    below = sum(1 for r in summary if r["Total"] and r["Percent"] < target)
 
-    st.subheader("Summary")
-    for r in attendance_summary(email):
-        t = target / 100
-        with st.container(border=True):
-            c1, c2 = st.columns([2, 3])
-            c1.markdown(f"**{r['Subject']}**  \n{r['Attended']} attended / {r['Total']} classes")
-            c2.progress(min(r["Percent"] / 100, 1.0), text=f"{r['Percent']}%")
-            if r["Total"] == 0:
-                c2.caption("No classes recorded yet.")
-            elif r["Percent"] >= target:
-                safe = math.floor(r["Attended"] / t - r["Total"])
-                c2.success(f"On track. You can miss {max(safe, 0)} more class(es) and stay above {target}%.")
-            else:
-                need = math.ceil((t * r["Total"] - r["Attended"]) / (1 - t))
-                c2.error(f"Below target. Attend the next {need} class(es) in a row to reach {target}%.")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Overall attendance", f"{round(100 * tot_p / tot_t, 1)}%" if tot_t else "–")
+    m2.metric("Classes attended", tot_p)
+    m3.metric("Classes missed", tot_t - tot_p)
+    m4.metric("Subjects below target", below)
 
-    with st.expander("Attendance records"):
-        recs = q("""SELECT a.id, s.name subject, a.day, a.status FROM attendance a
-                    JOIN subjects s ON s.id=a.subject_id WHERE a.email=? ORDER BY a.day DESC LIMIT 100""", (email,))
-        for r in recs:
-            c1, c2 = st.columns([6, 1])
-            c1.write(f"{r['day']} · {r['subject']} · {'✅' if r['status'] == 'Present' else '❌'} {r['status']}")
-            if c2.button("Delete", key=f"dat{r['id']}"):
+    tab_mark, tab_sum, tab_month, tab_rec = st.tabs(
+        ["✍️ Mark attendance", "📈 Summary", "🗓️ Monthly view", "🧾 Records"])
+
+    # ── Mark attendance for a whole day ──
+    with tab_mark:
+        d = st.date_input("Date", date.today(), max_value=date.today(), key="att_date")
+        day = d.isoformat()
+        pretty = d.strftime("%d %b %Y")
+        existing = {r["subject_id"]: r["status"]
+                    for r in q("SELECT subject_id, status FROM attendance WHERE email=? AND day=?", (email, day))}
+
+        b1, b2, b3 = st.columns(3)
+        quick = None
+        if b1.button("✅ Mark all Present", use_container_width=True):
+            quick = ("Present", f"All subjects marked Present for {pretty}.")
+        if b2.button("❌ Mark all Absent", use_container_width=True):
+            quick = ("Absent", f"All subjects marked Absent for {pretty}.")
+        if b3.button("🧹 Clear this day", use_container_width=True):
+            quick = ("No class", f"Cleared attendance for {pretty}.")
+        if quick:
+            for s in subs:
+                set_attendance(email, s["id"], day, quick[0])
+            ss.att_ver += 1
+            ss.att_flash = quick[1]
+            st.rerun()
+
+        st.caption(f"Choose a status for each subject on {pretty}. Use 'No class' for holidays or cancelled classes.")
+        options = ["Present", "Absent", "No class"]
+        with st.form(f"att_form_{day}_{ss.att_ver}"):
+            picks = {}
+            for s in subs:
+                cur = existing.get(s["id"], "No class")
+                picks[s["id"]] = st.radio(labels[s["id"]], options, index=options.index(cur), horizontal=True,
+                                          key=f"att_{day}_{s['id']}_{ss.att_ver}")
+            saved = st.form_submit_button("💾 Save attendance", type="primary")
+        if saved:
+            for sid, stt in picks.items():
+                set_attendance(email, sid, day, stt)
+            ss.att_ver += 1
+            ss.att_flash = f"Attendance saved for {pretty}."
+            st.rerun()
+
+    # ── Subject-wise summary ──
+    with tab_sum:
+        if not tot_t:
+            st.info("No attendance recorded yet. Mark your first day in the first tab.")
+        for r in summary:
+            with st.container(border=True):
+                c1, c2 = st.columns([2, 3])
+                c1.markdown(f"**{labels[r['id']]}**  \n{r['Attended']} attended / {r['Total']} classes")
+                c2.progress(min(r["Percent"] / 100, 1.0), text=f"{r['Percent']}%")
+                if r["Total"] == 0:
+                    c2.caption("No classes recorded yet.")
+                elif r["Percent"] >= target:
+                    safe = math.floor(r["Attended"] / t - r["Total"])
+                    c2.success(f"On track. You can miss {max(safe, 0)} more class(es) and stay at {target}% or above.")
+                else:
+                    need = math.ceil((t * r["Total"] - r["Attended"]) / (1 - t))
+                    c2.error(f"Below target. Attend the next {need} class(es) in a row to reach {target}%.")
+        chart = [{"Subject": labels[r["id"]], "Attendance %": r["Percent"]} for r in summary if r["Total"]]
+        if chart:
+            st.bar_chart(pd.DataFrame(chart).set_index("Subject"))
+
+    # ── Month grid ──
+    with tab_month:
+        today = date.today()
+        c1, c2 = st.columns(2)
+        month = c1.selectbox("Month", list(range(1, 13)), index=today.month - 1,
+                             format_func=lambda m: calendar.month_name[m])
+        year = int(c2.number_input("Year", 2020, 2100, today.year, 1))
+        first = date(year, month, 1)
+        last = date(year + (month == 12), (month % 12) + 1, 1) - timedelta(days=1)
+        recs = q("SELECT subject_id, day, status FROM attendance WHERE email=? AND day BETWEEN ? AND ?",
+                 (email, first.isoformat(), last.isoformat()))
+        recs = [r for r in recs if r["subject_id"] in labels]
+        if not recs:
+            st.info("No attendance recorded in this month.")
+        else:
+            mp = sum(1 for r in recs if r["status"] == "Present")
+            st.metric(f"{calendar.month_name[month]} {year} attendance", f"{round(100 * mp / len(recs), 1)}%",
+                      f"{mp} present · {len(recs) - mp} absent", delta_color="off")
+            grid = pd.DataFrame("", index=sorted({r["day"] for r in recs}),
+                                columns=[labels[s["id"]] for s in subs])
+            for r in recs:
+                grid.loc[r["day"], labels[r["subject_id"]]] = "✅" if r["status"] == "Present" else "❌"
+            grid.index = [datetime.strptime(i, "%Y-%m-%d").strftime("%d %b (%a)") for i in grid.index]
+            st.dataframe(grid, use_container_width=True)
+
+    # ── Records ──
+    with tab_rec:
+        flt = st.selectbox("Subject", ["All"] + [labels[s["id"]] for s in subs])
+        inv = {v: k for k, v in labels.items()}
+        rows = q("SELECT id, subject_id, day, status FROM attendance WHERE email=? ORDER BY day DESC, id DESC LIMIT 300",
+                 (email,))
+        rows = [r for r in rows if r["subject_id"] in labels and (flt == "All" or r["subject_id"] == inv[flt])]
+        if not rows:
+            st.info("No records.")
+        for r in rows[:100]:
+            c1, c2, c3 = st.columns([5, 1.3, 1.2])
+            c1.write(f"{r['day']} · **{labels[r['subject_id']]}** · "
+                     f"{'✅' if r['status'] == 'Present' else '❌'} {r['status']}")
+            if c2.button("Switch", key=f"sw{r['id']}", help="Flip between Present and Absent"):
+                run("UPDATE attendance SET status=? WHERE id=? AND email=?",
+                    ("Absent" if r["status"] == "Present" else "Present", r["id"], email))
+                ss.att_ver += 1
+                st.rerun()
+            if c3.button("Delete", key=f"dat{r['id']}"):
                 run("DELETE FROM attendance WHERE id=? AND email=?", (r["id"], email))
+                ss.att_ver += 1
                 st.rerun()
 
 
@@ -676,7 +802,7 @@ PAGES = {
     "Subjects & Grades": page_grades,
     "Concept Quiz": page_quiz,
     "Assignments": page_assignments,
-    "Attendance Ledger": page_attendance,
+    "Attendance Tracker": page_attendance,
     "Tasks Todo List": page_tasks,
     "Study Planner": page_planner,
 }
